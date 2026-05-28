@@ -1,0 +1,19 @@
+[project]
+name = "polars-io-benchmark"
+version = "0.1.0"
+description = "Polars replication of CSV, Feather, Pickle, and Parquet I/O benchmark"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.9",
+    "numpy>=2.0",
+    "polars>=1.0",
+]
+
+[project.scripts]
+polars-io-benchmark = "polars_io_benchmark.cli:main"
+polars-io-plot = "polars_io_benchmark.plot:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
