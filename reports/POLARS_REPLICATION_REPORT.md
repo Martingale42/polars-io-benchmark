@@ -497,3 +497,105 @@ uv run polars-io-plot --combined
 - 跨多個 seed 測 storage 穩定性。
 - 加入 `scan_*` lazy 路徑對比。
 - 加入 multiprocess 並行讀寫 throughput 測量。
+
+---
+
+## 13. 技術註記：為什麼 Parquet 寫入贏 Feather
+
+直覺上，「Feather = in-memory layout 直接 dump」應該是最快的寫入路徑，撞磁碟頻寬上限，其他格式都要追它。實測 5M nonopt 卻是：
+
+```
+parquet_zstd   0.893 s  ← 第 1
+parquet_snappy 1.088 s
+csv            2.353 s
+feather_ipc    2.902 s  ← 第 4
+pickle         5.168 s
+```
+
+Parquet zstd 比 Feather 快 **3.25 倍**。下面解釋為什麼這在資訊理論上是合理的。
+
+### 13.1 「Feather 撞磁碟頻寬上限」是真的——這正是它的劣勢
+
+5M nonopt feather 寫出 1729 MB；本機 NVMe SSD 寫入 throughput 大約 600 MB/s（含 filesystem overhead），所以 ~2.5 秒寫盤是硬體底線。**Feather 沒寫慢，是寫的量太大**。
+
+而 5M nonopt parquet_zstd 寫出 **384 MB**。即使 zstd 要付壓縮 CPU，但寫盤量是 Feather 的 22%：
+
+| 格式 | 寫出大小 | 寫盤估算 | 壓縮 CPU 估算 | 實測 total |
+| --- | ---: | ---: | ---: | ---: |
+| feather_ipc | 1729 MB | ~2.5 s | 0 | 2.90 s |
+| parquet_snappy | 547 MB | ~0.7 s | ~0.4 s | 1.09 s |
+| parquet_zstd | 384 MB | ~0.5 s | ~0.4 s | 0.89 s |
+
+→ 對「資料有結構」的場景，**壓縮的 CPU 成本 < 多寫出去的磁碟成本**。Parquet 用「先省再寫」策略繞過了磁碟頻寬瓶頸。
+
+### 13.2 為什麼 nonopt 資料對 Parquet 是「天堂模式」
+
+nonopt schema 把 col_1–col_16 全部 stringify。表面是 16 個 String column，實際內容裡有 12 個是低基數重複資料：
+
+| 欄位 | 內容 | Parquet 壓縮可達 |
+| --- | --- | --- |
+| col_1–col_4 | 從 8 個字串挑一個 | dictionary encoding → 3-bit 索引，**省 95%+** |
+| col_5 | 整數 -100 到 100 stringify | dictionary + RLE，**省 80%+** |
+| col_6–col_8 | 較大整數 stringify | dictionary 命中率較低，仍能壓 50%+ |
+| col_9–col_12 | 浮點數 stringify | 大字串、低重複，壓縮比差 |
+| col_13–col_16 | `"true"` / `"false"` | dictionary → 1 bit，**省 99%** |
+| col_17–col_20 | Datetime(ns) | delta + bit-pack |
+
+Parquet 的 dictionary encoding + RLE + bit-packing 對這種資料是結構性碾壓。
+
+對比 Arrow IPC：**它沒有 dictionary encoding 也沒有 RLE**。`"true"` 寫 4 個 byte、`"false"` 寫 5 個 byte，5M 次照寫 5M 次。
+
+### 13.3 Arrow IPC 與 Parquet 設計目的不同
+
+兩個都在 Arrow 生態系，但分工不同：
+
+| | Arrow IPC / Feather | Parquet |
+| --- | --- | --- |
+| 設計目的 | 序列化 in-memory format，做 IPC / shared memory | 磁碟長期儲存 |
+| 重新編碼 | **否**（直接 dump in-memory layout） | **強制**（dictionary / RLE / bit-pack） |
+| Codec 壓縮 | v2 可選 LZ4/Zstd buffer 級壓縮（Polars 預設沒開） | 標配 snappy / zstd / gzip / lz4 |
+| 寫入 wall-clock | 受磁碟頻寬主導 | 受 (寫盤量 + 壓縮 CPU) 的最大者主導 |
+
+「Feather 寫得快」對 **in-memory → in-memory 傳輸**（同機器 multi-process 共享）是對的；對 **in-memory → disk** 且資料有結構時是錯的。
+
+### 13.4 opt schema 把差距收窄
+
+5M opt write：
+
+```
+parquet_zstd    0.457 s  ← 第 1
+parquet_snappy  0.484 s
+feather_ipc     0.547 s  ← 第 3，只輸 17%
+pickle          1.043 s
+csv             2.023 s
+```
+
+opt schema 把欄位塞成原生 typed binary：Int8/Int16/Int32（每格 1–4 byte）、Float32（4 byte）、Boolean（1 bit）、Categorical（Polars 已自帶 dictionary）。**Polars in-memory format 自己就很緊湊**，所以 Parquet 「重新編碼」能省的空間從「3 倍」縮成「25%」，差距同步收窄到個位數百分比。
+
+### 13.5 Pickle 寫出同樣的 byte 卻慢 78%
+
+報告 §9 證實：Polars `pickle.dump(df)` 與 `df.write_ipc()` 寫出的 byte 差距 ≤ 30 KB（pickle envelope）。檔案內容幾乎一樣，但 5M nonopt 寫入時間：
+
+```
+feather_ipc  2.90 s
+pickle       5.17 s  ← 慢 78%
+```
+
+差距來自寫入路徑：
+
+| 路徑 | 步驟 |
+| --- | --- |
+| `write_ipc` | Polars Rust → 直接寫 file descriptor（zero-copy，無 Python 介入） |
+| `pickle.dump` | Python 呼叫 `df.__reduce__()` → Polars 生成 IPC bytes 在 Python heap → pickle 包 envelope → `file.write()` 分塊寫入（全程在 Python interpreter，要過 GC 與 refcount） |
+
+→ **同樣結果，Python 繞道吃掉 2 秒以上**。「同一串 byte 在磁碟上」≠「同樣速度寫出來」，產出那串 byte 的程式碼路徑才是決定因素。
+
+### 13.6 心智模型校正
+
+| 情境 | 寫入排名（依據本實驗 Polars 1.41.1） |
+| --- | --- |
+| 小資料 (< 100k 行)，opt | Pickle ≈ Feather > Parquet > CSV |
+| 中大資料 (≥ 200k 行)，nonopt 或 high-cardinality strings | **Parquet (zstd) > Parquet (snappy) >> Feather > CSV >> Pickle** |
+| 中大資料，opt 純 numeric | Parquet (zstd) ≈ Parquet (snappy) ≈ Feather > Pickle >> CSV |
+
+「Feather 適合寫入」的口號更精確的說法是：適合 **緊湊 typed 資料 + 小批次 + 同 process 短期快取**。一旦資料量大、有結構、要長期保存 → Parquet。
