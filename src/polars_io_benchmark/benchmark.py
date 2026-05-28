@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import pickle
+import random
 import statistics as stats
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -13,7 +14,7 @@ import numpy as np
 import polars as pl
 
 DEFAULT_SEED = 42
-DEFAULT_REPEATS = 5
+DEFAULT_REPEATS = 30
 DEFAULT_OUTDIR = Path("benchmark_out")
 DEFAULT_SIZES = (1_000, 10_000, 100_000, 1_000_000)
 FULL_SIZES = (
@@ -107,25 +108,29 @@ def csv_parse_schema(schema: dict[str, pl.DataType]) -> dict[str, pl.DataType]:
     return csv_schema
 
 
-def read_csv_typed(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
-    df = pl.read_csv(path, schema=csv_parse_schema(schema), try_parse_dates=True)
-    return cast_schema(df, schema)
+def read_csv_raw(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+    return pl.read_csv(path, schema=csv_parse_schema(schema), try_parse_dates=True)
 
 
 def write_csv(df: pl.DataFrame, path: Path) -> None:
     df.write_csv(path)
 
 
-def read_ipc_typed(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
-    return cast_schema(pl.read_ipc(path), schema)
+def read_ipc_raw(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+    # memory_map=False forces eager read so IPC timing is comparable to
+    # CSV/Parquet/Pickle which materialize data on read. Without this Polars
+    # mmaps the file and `read` returns in ~1 ms regardless of file size,
+    # making IPC look 1000x faster than reality and breaking the additivity
+    # of read+write vs write.
+    return pl.read_ipc(path, memory_map=False)
 
 
 def write_ipc(df: pl.DataFrame, path: Path) -> None:
     df.write_ipc(path)
 
 
-def read_parquet_typed(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
-    return cast_schema(pl.read_parquet(path), schema)
+def read_parquet_raw(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+    return pl.read_parquet(path)
 
 
 def write_parquet_snappy(df: pl.DataFrame, path: Path) -> None:
@@ -133,13 +138,12 @@ def write_parquet_snappy(df: pl.DataFrame, path: Path) -> None:
 
 
 def write_parquet_zstd(df: pl.DataFrame, path: Path) -> None:
-    df.write_parquet(path, compression="zstd")
+    df.write_parquet(path, compression="zstd", compression_level=3)
 
 
-def read_pickle_typed(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
+def read_pickle_raw(path: Path, schema: dict[str, pl.DataType]) -> pl.DataFrame:
     with path.open("rb") as file:
-        df = pickle.load(file)
-    return cast_schema(df, schema)
+        return pickle.load(file)
 
 
 def write_pickle(df: pl.DataFrame, path: Path) -> None:
@@ -148,32 +152,47 @@ def write_pickle(df: pl.DataFrame, path: Path) -> None:
 
 
 FORMATS: dict[str, FormatSpec] = {
-    "csv": FormatSpec(".csv", read_csv_typed, write_csv),
-    "feather_ipc": FormatSpec(".feather", read_ipc_typed, write_ipc),
-    "parquet_snappy": FormatSpec(".parquet", read_parquet_typed, write_parquet_snappy),
-    "parquet_zstd": FormatSpec(".parquet", read_parquet_typed, write_parquet_zstd),
-    "pickle": FormatSpec(".pkl", read_pickle_typed, write_pickle),
+    "csv": FormatSpec(".csv", read_csv_raw, write_csv),
+    "feather_ipc": FormatSpec(".feather", read_ipc_raw, write_ipc),
+    "parquet_snappy": FormatSpec(".parquet", read_parquet_raw, write_parquet_snappy),
+    "parquet_zstd": FormatSpec(".parquet", read_parquet_raw, write_parquet_zstd),
+    "pickle": FormatSpec(".pkl", read_pickle_raw, write_pickle),
 }
 
 
-def timed(fn: Callable[[], object], repeats: int) -> dict[str, float]:
-    timings: list[float] = []
-    for _ in range(repeats):
-        gc.collect()
+def timed_once(fn: Callable[[], object]) -> float:
+    """
+    Definition: Run fn once with GC disabled, return wall-clock seconds.
+    Domain:     fn is any side-effecting callable; raises propagate.
+    Returns:    Elapsed seconds as float (perf_counter resolution).
+    """
+    gc.collect()
+    gc.disable()
+    try:
         start = time.perf_counter()
         fn()
-        timings.append(time.perf_counter() - start)
+        return time.perf_counter() - start
+    finally:
+        gc.enable()
 
+
+def collect_stats(samples: list[float]) -> dict[str, object]:
     return {
-        "min_s": min(timings),
-        "median_s": stats.median(timings),
-        "mean_s": stats.mean(timings),
-        "samples_s": json.dumps(timings),
+        "min_s": min(samples),
+        "median_s": stats.median(samples),
+        "mean_s": stats.mean(samples),
+        "samples_s": json.dumps(samples),
     }
 
 
 def file_size_mb(path: Path) -> float:
     return path.stat().st_size / 1024 / 1024
+
+
+# Shuffle order is deterministic per (n, kind) but independent across them,
+# so any system-noise event is spread across formats/ops instead of hitting
+# one column of the result table.
+KIND_OFFSETS = {"nonopt": 0, "opt": 1}
 
 
 def benchmark_one(
@@ -184,45 +203,75 @@ def benchmark_one(
     outdir: Path,
     repeats: int,
     formats: Sequence[str],
+    seed: int,
 ) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
     ram_mb = df.estimated_size("mb")
+    paths: dict[str, Path] = {}
+    roundtrip_paths: dict[str, Path] = {}
+    samples: dict[str, dict[str, list[float]]] = {
+        fmt: {"write": [], "read": [], "rw": []} for fmt in formats
+    }
 
-    for format_name in formats:
-        io = FORMATS[format_name]
-        path = outdir / f"{kind}_{n}_{format_name}{io.suffix}"
-        roundtrip_path = outdir / f"{kind}_{n}_{format_name}_roundtrip{io.suffix}"
+    # Priming write: ensure files exist before any timed read.
+    # This write is intentionally untimed.
+    for fmt in formats:
+        io = FORMATS[fmt]
+        paths[fmt] = outdir / f"{kind}_{n}_{fmt}{io.suffix}"
+        roundtrip_paths[fmt] = outdir / f"{kind}_{n}_{fmt}_roundtrip{io.suffix}"
+        io.writer(df, paths[fmt])
 
-        write_stats = timed(lambda: io.writer(df, path), repeats)
-        size_mb = file_size_mb(path)
-        read_stats = timed(lambda: io.reader(path, schema), repeats)
+    rng_local = random.Random(seed * 1_000_003 + n * 7 + KIND_OFFSETS[kind])
 
-        def read_then_write() -> None:
-            loaded = io.reader(path, schema)
-            io.writer(loaded, roundtrip_path)
+    for _ in range(repeats):
+        ops = [(fmt, op) for fmt in formats for op in ("write", "read", "rw")]
+        rng_local.shuffle(ops)
+        for fmt, op in ops:
+            io = FORMATS[fmt]
+            path = paths[fmt]
+            if op == "write":
+                elapsed = timed_once(
+                    lambda io=io, df=df, path=path: io.writer(df, path)
+                )
+            elif op == "read":
+                elapsed = timed_once(
+                    lambda io=io, path=path, schema=schema: io.reader(path, schema)
+                )
+            else:
+                rpath = roundtrip_paths[fmt]
 
-        read_write_stats = timed(read_then_write, repeats)
-        roundtrip_path.unlink(missing_ok=True)
+                def rw(io=io, path=path, rpath=rpath, schema=schema) -> None:
+                    loaded = io.reader(path, schema)
+                    io.writer(loaded, rpath)
 
+                elapsed = timed_once(rw)
+                rpath.unlink(missing_ok=True)
+            samples[fmt][op].append(elapsed)
+
+    rows: list[dict[str, object]] = []
+    for fmt in formats:
+        size_mb = file_size_mb(paths[fmt])
+        w = collect_stats(samples[fmt]["write"])
+        r = collect_stats(samples[fmt]["read"])
+        rw_stats = collect_stats(samples[fmt]["rw"])
         rows.append(
             {
                 "n": n,
                 "kind": kind,
-                "format": format_name,
+                "format": fmt,
                 "ram_mb": ram_mb,
                 "file_mb": size_mb,
-                "write_min_s": write_stats["min_s"],
-                "write_median_s": write_stats["median_s"],
-                "write_mean_s": write_stats["mean_s"],
-                "write_samples_s": write_stats["samples_s"],
-                "read_min_s": read_stats["min_s"],
-                "read_median_s": read_stats["median_s"],
-                "read_mean_s": read_stats["mean_s"],
-                "read_samples_s": read_stats["samples_s"],
-                "read_write_min_s": read_write_stats["min_s"],
-                "read_write_median_s": read_write_stats["median_s"],
-                "read_write_mean_s": read_write_stats["mean_s"],
-                "read_write_samples_s": read_write_stats["samples_s"],
+                "write_min_s": w["min_s"],
+                "write_median_s": w["median_s"],
+                "write_mean_s": w["mean_s"],
+                "write_samples_s": w["samples_s"],
+                "read_min_s": r["min_s"],
+                "read_median_s": r["median_s"],
+                "read_mean_s": r["mean_s"],
+                "read_samples_s": r["samples_s"],
+                "read_write_min_s": rw_stats["min_s"],
+                "read_write_median_s": rw_stats["median_s"],
+                "read_write_mean_s": rw_stats["mean_s"],
+                "read_write_samples_s": rw_stats["samples_s"],
             }
         )
 
@@ -241,21 +290,17 @@ def run_benchmark(
     all_rows: list[dict[str, object]] = []
 
     for n in sizes:
-        print(f"Running n={n:,} non-optimized")
-        nonopt_df = make_nonopt_df(n, seed)
-        all_rows.extend(
-            benchmark_one(n, "nonopt", nonopt_df, NONOPT_SCHEMA, outdir, repeats, formats)
-        )
-        del nonopt_df
-        gc.collect()
-
-        print(f"Running n={n:,} optimized")
-        opt_df = make_opt_df(n, seed)
-        all_rows.extend(
-            benchmark_one(n, "opt", opt_df, OPT_SCHEMA, outdir, repeats, formats)
-        )
-        del opt_df
-        gc.collect()
+        for kind, mk_df, schema in (
+            ("nonopt", make_nonopt_df, NONOPT_SCHEMA),
+            ("opt", make_opt_df, OPT_SCHEMA),
+        ):
+            print(f"Running n={n:,} {kind} ({repeats} reps, interleaved)")
+            df = mk_df(n, seed)
+            all_rows.extend(
+                benchmark_one(n, kind, df, schema, outdir, repeats, list(formats), seed)
+            )
+            del df
+            gc.collect()
 
     results = pl.DataFrame(all_rows).sort(["n", "kind", "format"])
     results.write_csv(outdir / "polars_io_benchmark_results.csv")
