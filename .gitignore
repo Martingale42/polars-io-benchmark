@@ -12,3 +12,14 @@ wheels/
 # Benchmark output
 benchmark_out*/
 polars_io_benchmark_out/
+# Keep plots so reports/*.md render on GitHub.
+!benchmark_out/
+!benchmark_out/plots/
+!benchmark_out/plots/**
+# But re-exclude the bulky data files inside benchmark_out/ and the
+# matplotlib font cache that plot.py drops next to the PNGs.
+benchmark_out/*.csv
+benchmark_out/*.feather
+benchmark_out/*.parquet
+benchmark_out/*.pkl
+benchmark_out/plots/.matplotlib/
